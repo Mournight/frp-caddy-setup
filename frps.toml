@@ -1,0 +1,10 @@
+# ======================= FRPS 服务端配置模板 =======================
+# 说明：此文件由 update_server_configs.ps1 读取，占位符会被 .env 中的值替换后上传
+# 按需修改 token / 端口
+
+bindPort = {{FRPS_BIND_PORT}}
+
+auth.method = "token"
+auth.token = "{{FRPS_AUTH_TOKEN}}"
+
+transport.tls.force = true
