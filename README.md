@@ -9,7 +9,7 @@
 - **UFW 防火墙** 自动配置，仅开放必要端口
 - **SSH 密钥** 自动生成并写入服务器（首次需输入一次密码，之后免密）
 - **APT 源** 自动检测 Debian 版本（兼容 Debian 11 / 12）
-- 所有敏感信息通过 `.env` 文件管理，不会泄露到代码中
+- 所有敏感信息保存在 `.env` 或本地忽略文件中，不会进入 Git 仓库
 
 ## 📋 前置条件
 
@@ -19,6 +19,21 @@
 | **远程服务器** | Debian 11 或 Debian 12（root 权限） |
 | **域名** | 一个域名，DNS 托管在 Cloudflare |
 | **Cloudflare API Token** | 用于 DNS-01 验证签发泛域名证书 |
+
+## ⚠️ 先做这一步：把 SSH 端口改到 2222
+
+如果你是第一次拿到服务器，**请先去云服务商自带的网页控制台 / 串口控制台 / VNC 控制台**，用 root 登录后粘贴下面这段命令。
+
+这样做的原因很简单：**22 端口在很多网络、代理链路、运营商出口和云厂商风控链路里会被特殊处理**。改成 `2222` 后，远程连接通常会稳定很多。
+
+```bash
+cp -a /etc/ssh/sshd_config /etc/ssh/sshd_config.bak.$(date +%s)
+grep -q '^Port 2222$' /etc/ssh/sshd_config || printf '\nPort 2222\n' >> /etc/ssh/sshd_config
+sshd -t && (ufw allow 2222/tcp >/dev/null 2>&1 || true) && (systemctl restart ssh || systemctl restart sshd)
+ss -ltnp | grep ':2222'
+```
+
+如果最后一行能看到 `:2222`，说明修改成功。后续本项目的脚本也默认按 `2222` 来连接。
 
 ### 获取 Cloudflare API Token
 
@@ -37,26 +52,37 @@ Copy-Item .env.example .env
 编辑 `.env`，填入你的服务器信息：
 
 ```env
+SSH_HOST=你的服务器公网IP
 SSH_USER=root
-SSH_PORT=22
+SSH_PORT=2222
 FRPS_BIND_PORT=7000
 FRPS_AUTH_TOKEN=你的FRP认证密码
-DOMAIN=你的域名.com
-CF_DNS_TOKEN=你的Cloudflare_API_Token
 ```
+
+其中：
+- `SSH_HOST`：用于 SSH / SCP 连接服务器，推荐填写公网 IP
+- `SSH_PORT`：推荐填写 `2222`
 
 ### 2. 编辑 Caddyfile
 
-打开 `Caddyfile`，添加你需要的子域名反向代理规则：
+先复制示例文件：
 
+```powershell
+Copy-Item .\Caddyfile.example .\Caddyfile
 ```
-*.{{DOMAIN}}, {{DOMAIN}} {
+
+然后编辑本地 `Caddyfile`，把里面的域名、Cloudflare Token 和反向代理端口改成你的真实值。
+
+`Caddyfile` 会被 `.gitignore` 忽略，**不会提交到 Git**；仓库里只保留 `Caddyfile.example` 作为示例。
+
+```caddyfile
+*.1dea.top, 1dea.top {
     tls {
-        dns cloudflare {{CF_DNS_TOKEN}}
+        dns cloudflare your-cloudflare-api-token
     }
 
     # 取消注释并修改为你的子域名和端口
-    @myapp host myapp.{{DOMAIN}}
+    @myapp host myapp.1dea.top
     handle @myapp {
         reverse_proxy 127.0.0.1:你的本地端口
     }
@@ -66,8 +92,6 @@ CF_DNS_TOKEN=你的Cloudflare_API_Token
     }
 }
 ```
-
-> `{{DOMAIN}}` 和 `{{CF_DNS_TOKEN}}` 是占位符，部署时会自动替换为 `.env` 中的值，**不要手动替换**。
 
 ### 3. 运行基础部署
 
@@ -87,7 +111,7 @@ CF_DNS_TOKEN=你的Cloudflare_API_Token
 ```
 
 这一步会：
-- 将 `frps.toml` 和 `Caddyfile` 中的占位符替换为实际值
+- 上传本地 `frps.toml` 和 `Caddyfile`
 - 上传到服务器并验证 Caddy 配置
 - 启动 / 重启 FRPS 和 Caddy 服务
 
@@ -100,7 +124,8 @@ CF_DNS_TOKEN=你的Cloudflare_API_Token
 | `deploy_server_frps_caddy.ps1` | 基础部署脚本（安装软件 + 防火墙） |
 | `update_server_configs.ps1` | 配置上传脚本（推送配置 + 重启服务） |
 | `frps.toml` | FRP 服务端配置模板 |
-| `Caddyfile` | Caddy 反向代理配置模板 |
+| `Caddyfile.example` | Caddy 配置示例文件（可提交到 Git） |
+| `Caddyfile` | **你的实际 Caddy 配置（已被 .gitignore 忽略）** |
 
 ## 🔧 日常维护
 
@@ -119,5 +144,7 @@ CF_DNS_TOKEN=你的Cloudflare_API_Token
 ## ⚠️ 注意事项
 
 - `.env` 文件包含敏感信息，**绝对不要提交到 Git**（已在 `.gitignore` 中排除）
+- `Caddyfile` 中通常会包含真实域名、Cloudflare Token 或内网端口，**也不要提交到 Git**
+- 如果本地启用了 Clash Fake IP、代理 DNS 或其他特殊网络环境，**务必填写 `SSH_HOST` 为服务器真实公网 IP**
 - 首次部署时如果你的服务器在境外，确保本地网络可以访问（可能需要代理）
 - FRP 客户端的 `auth.token` 必须与 `.env` 中的 `FRPS_AUTH_TOKEN` 保持一致

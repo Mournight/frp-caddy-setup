@@ -26,11 +26,15 @@ function Import-DotEnv {
 $cfg = Import-DotEnv
 
 # 必填项校验
-foreach ($key in @('DOMAIN', 'SSH_USER', 'SSH_PORT', 'FRPS_BIND_PORT')) {
+foreach ($key in @('SSH_USER', 'SSH_PORT', 'FRPS_BIND_PORT')) {
     if (-not $cfg[$key]) { throw ".env 中缺少必填项: $key" }
 }
 
-$ServerIp      = $cfg['DOMAIN']
+if (-not $cfg['SSH_HOST'] -and -not $cfg['DOMAIN']) {
+    throw ".env 中至少需要提供 SSH_HOST 或 DOMAIN 其中之一。"
+}
+
+$ServerHost    = if ($cfg['SSH_HOST']) { $cfg['SSH_HOST'] } else { $cfg['DOMAIN'] }
 $SshUser       = $cfg['SSH_USER']
 $SshPort       = [int]$cfg['SSH_PORT']
 $FrpVersion    = if ($cfg['FRP_VERSION']) { $cfg['FRP_VERSION'] } else { 'latest' }
@@ -56,7 +60,7 @@ if ($AcceptNewHostKey) {
   $sshOptions += @("-o", "StrictHostKeyChecking=accept-new")
 }
 
-$target = "$SshUser@$ServerIp"
+$target = "$SshUser@$ServerHost"
 
 function Test-KeyLogin {
   & $ssh @sshOptions -p $SshPort -i $SshPrivateKeyPath -o BatchMode=yes $target "echo key-auth-ok" | Out-Null
@@ -250,6 +254,6 @@ $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
 
 Ensure-SshKeyAuth
 
-Write-Host "开始基础部署到 $ServerIp ..." -ForegroundColor Cyan
-(Get-Content $tmpScript -Raw) -replace [char]0xFEFF, "" -replace "`r`n", "`n" | & $ssh @sshOptions -p $SshPort -i $SshPrivateKeyPath -o BatchMode=yes "$SshUser@$ServerIp" "bash -s"
+Write-Host "开始基础部署到 $ServerHost ..." -ForegroundColor Cyan
+(Get-Content $tmpScript -Raw) -replace [char]0xFEFF, "" -replace "`r`n", "`n" | & $ssh @sshOptions -p $SshPort -i $SshPrivateKeyPath -o BatchMode=yes "$SshUser@$ServerHost" "bash -s"
 Write-Host "基础部署完成。" -ForegroundColor Green

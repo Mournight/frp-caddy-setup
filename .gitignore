@@ -1,5 +1,8 @@
 # 敏感配置
 .env
+Caddyfile
+!Caddyfile.example
+.backups/
 
 # 临时文件
 *.tmp

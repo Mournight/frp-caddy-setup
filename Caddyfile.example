@@ -1,0 +1,31 @@
+# ======================= Caddy 泛域名配置示例 =======================
+# 用法：
+# 1. 复制本文件为同目录下的 Caddyfile
+# 2. 把下面的域名、Cloudflare Token、反向代理端口改成你的真实值
+# 3. 运行 update_server_configs.ps1 上传并重启服务
+#
+# 说明：
+# - 这里直接写真实域名，不再使用模板占位符
+# - 真实 Caddyfile 会被 .gitignore 忽略，避免把敏感信息提交到 Git
+# - 泛域名证书必须使用 DNS Challenge，因此需要 Cloudflare Token
+
+*.example.com, example.com {
+    tls {
+        dns cloudflare your-cloudflare-api-token
+    }
+
+    @git host git.example.com
+    handle @git {
+        reverse_proxy 127.0.0.1:13000
+    }
+
+    @i host i.example.com example.com
+    handle @i {
+        reverse_proxy 127.0.0.1:12368
+    }
+
+    # 未匹配的子域名返回 404
+    handle {
+        respond "Not Found" 404
+    }
+}
