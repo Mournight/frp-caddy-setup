@@ -6,3 +6,5 @@ Caddyfile
 
 # 临时文件
 *.tmp
+*.zip
+*.7z

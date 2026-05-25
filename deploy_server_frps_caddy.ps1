@@ -39,6 +39,7 @@ $SshUser       = $cfg['SSH_USER']
 $SshPort       = [int]$cfg['SSH_PORT']
 $FrpVersion    = if ($cfg['FRP_VERSION']) { $cfg['FRP_VERSION'] } else { 'latest' }
 $FrpsBindPort  = [int]$cfg['FRPS_BIND_PORT']
+$EnableBbrv1   = if ($cfg['ENABLE_BBRV1']) { $cfg['ENABLE_BBRV1'] } else { 'true' }
 
 # SSH 私钥路径（已有密钥则直接使用，不会覆盖）
 $SshPrivateKeyPath = Join-Path $env:USERPROFILE ".ssh\id_ed25519"
@@ -106,7 +107,7 @@ fi
 systemctl restart sshd 2>/dev/null || service ssh restart 2>/dev/null || true
 "@
 
-  # 剥除 CRLF，写入临时文件后通过 bash -s pipe 执行
+  # 剥除 CRLF，写入临时文件后通过 bash -s pipe执行
   $tmpAddKeyScript = Join-Path $env:TEMP "add_authorized_key.sh"
   $addKeyCmdClean = $remoteAddKeyCmd -replace [char]0xFEFF, "" -replace "`r`n", "`n" -replace "`r", ""
   $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
@@ -130,31 +131,19 @@ systemctl restart sshd 2>/dev/null || service ssh restart 2>/dev/null || true
 $remoteScript = @"
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
+ENABLE_BBR="${EnableBbrv1}"
 
+# 自动检测系统版本（仅用于日志输出，不再强制改写软件源，保护 VPS 自带的最佳源）
+ID=`$(. /etc/os-release && echo "`$ID")
 CODENAME=`$(. /etc/os-release && echo "`$VERSION_CODENAME")
-if [ -z "`$CODENAME" ]; then
-  echo '无法检测系统版本代号，中止部署。'
-  exit 1
-fi
-
 VER=`$(. /etc/os-release && echo "`$VERSION_ID")
-NFW=''
-if [ "`$VER" -ge 12 ] 2>/dev/null; then
-  NFW=' non-free-firmware'
-fi
+echo "检测到系统版本: `$ID `$VER (`$CODENAME)"
 
-echo "检测到系统版本: Debian `$VER (`$CODENAME)"
-
-{
-  echo "deb http://deb.debian.org/debian `$CODENAME main contrib non-free`$NFW"
-  echo "deb http://deb.debian.org/debian `$CODENAME-updates main contrib non-free`$NFW"
-  echo "deb http://security.debian.org/debian-security `$CODENAME-security main contrib non-free`$NFW"
-} > /etc/apt/sources.list
-
-apt-get clean
-rm -rf /var/lib/apt/lists/*
+# 仅更新系统当前配置的高速源，保留 VPS 原生最快链路
 apt-get update
-apt-get install -y wget curl tar ufw gnupg debian-keyring debian-archive-keyring apt-transport-https
+# 安装 Debian 和 Ubuntu 通用的核心依赖包
+# 移除了 Debian 专有的 debian-keyring 和 debian-archive-keyring 包以避免在 Ubuntu 系统上报错无法定位软件包
+apt-get install -y wget curl tar ufw gnupg apt-transport-https
 
 FRPS_INSTALLED='false'
 if [ -x /opt/frp/frps ] && [ -f /etc/systemd/system/frps.service ]; then
@@ -162,12 +151,20 @@ if [ -x /opt/frp/frps ] && [ -f /etc/systemd/system/frps.service ]; then
 else
   FRP_VERSION='${FrpVersion}'
   if [ -z "`$FRP_VERSION" ] || [ "`$FRP_VERSION" = "latest" ]; then
-    FRP_VERSION=`$(curl -fsSL https://api.github.com/repos/fatedier/frp/releases/latest | sed -n 's/.*"tag_name":[[:space:]]*"v\([^"]*\)".*/\1/p' | head -n1)
-  fi
-
-  if [ -z "`$FRP_VERSION" ]; then
-    echo '无法获取 FRP 最新版本号，请检查网络后重试。'
-    exit 1
+    echo "正在从 GitHub 获取 FRP 最新版本号..."
+    # 优先使用无需 API 凭证的 Location HEAD 重定向机制，避免 GitHub API 的 403 限流
+    FRP_VERSION=`$(curl -sI https://github.com/fatedier/frp/releases/latest | grep -Ei '^location:' | awk -F'/tag/v' '{print `$2}' | tr -d '\r\n' || echo "")
+    
+    # 备用方案：如果重定向抓取失败，再通过官方 API 端口尝试
+    if [ -z "`$FRP_VERSION" ]; then
+      FRP_VERSION=`$(curl -fsSL https://api.github.com/repos/fatedier/frp/releases/latest 2>/dev/null | sed -n 's/.*"tag_name":[[:space:]]*"v\([^"]*\)".*/\1/p' | head -n1 || echo "")
+    fi
+    
+    # 终极兜底：如果前两者皆因网络原因失效，使用硬编码的已知稳定版本，防止部署被强行挂断
+    if [ -z "`$FRP_VERSION" ]; then
+      echo "⚠️ 警告：无法实时获取 GitHub 最新版本号（可能被 GitHub 403 限流），已采用硬编码稳定版本 0.61.0 进行兜底安装。"
+      FRP_VERSION="0.61.0"
+    fi
   fi
 
   ARCHIVE="frp_`${FRP_VERSION}_linux_amd64.tar.gz"
@@ -227,23 +224,93 @@ ufw allow ${SshPort}/tcp
 ufw allow ${FrpsBindPort}/tcp
 ufw allow 80/tcp
 ufw allow 443/tcp
-"@
 
-$remoteScript += @"
+# 自动开启 BBRv1 拥塞控制算法
+if [ "`$ENABLE_BBR" = "true" ]; then
+  echo "正在配置并开启 BBRv1 拥塞控制算法..."
+  if modprobe tcp_bbr 2>/dev/null || lsmod | grep -q bbr; then
+    # 确保文件存在，防止极度精简版系统缺失该文件
+    touch /etc/sysctl.conf
+    sed -i '/net.core.default_qdisc/d' /etc/sysctl.conf
+    sed -i '/net.ipv4.tcp_congestion_control/d' /etc/sysctl.conf
+    echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf
+    echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf
+    sysctl -p || true
+    echo "BBRv1 启用指令已执行，当前算法为: `$(sysctl -n net.ipv4.tcp_congestion_control || echo '未知')"
+  else
+    echo "⚠️ 警告: 当前系统内核未加载或不支持 BBR 模块，跳过开启。"
+  fi
+fi
+
 ufw --force enable
 
-echo '=== BASE DEPLOY DONE ==='
-echo 'FRP binary:'
-/opt/frp/frps --version || true
-echo 'caddy:'
-caddy version || true
-echo 'frps service enabled:'
-systemctl is-enabled frps || true
-echo 'caddy service enabled:'
-systemctl is-enabled caddy || true
-echo "FRPS installed this run: `$FRPS_INSTALLED"
-echo "Caddy installed this run: `$CADDY_INSTALLED"
-echo '下一步：运行 update_server_configs.ps1 上传 frps.toml 和 Caddyfile 并启动/重载服务。'
+# ========================= 部署状态检测与报告 =========================
+echo ""
+echo "=================================================="
+echo "          FRP + Caddy 基础部署状态报告"
+echo "=================================================="
+
+# 1. 检测 FRP (FRPS) 状态
+FRP_STATUS="❌ 未安装"
+FRP_VER="无"
+if [ -x /opt/frp/frps ]; then
+  FRP_VER=`$(/opt/frp/frps --version 2>/dev/null || echo "未知")
+  if systemctl is-enabled frps >/dev/null 2>&1; then
+    FRP_STATUS="🟢 已安装并启用开机自启 (v`$FRP_VER)"
+  else
+    FRP_STATUS="🟡 已安装但未启用服务 (v`$FRP_VER)"
+  fi
+fi
+echo "1. FRP 服务端 (FRPS): `$FRP_STATUS"
+
+# 2. 检测 Caddy 状态
+CADDY_STATUS="❌ 未安装"
+CADDY_VER="无"
+CF_PLUGIN="❌ 未安装"
+if command -v caddy >/dev/null 2>&1; then
+  CADDY_VER=`$(caddy version 2>/dev/null | cut -d' ' -f1 || echo "未知")
+  if systemctl is-enabled caddy >/dev/null 2>&1; then
+    CADDY_STATUS="🟢 已安装并启用开机自启 (`$CADDY_VER)"
+  else
+    CADDY_STATUS="🟡 已安装但未启用服务 (`$CADDY_VER)"
+  fi
+  
+  if caddy list-modules 2>/dev/null | grep -q 'dns.providers.cloudflare'; then
+    CF_PLUGIN="🟢 已成功安装"
+  else
+    CF_PLUGIN="❌ 未安装 (Cloudflare DNS 插件缺失)"
+  fi
+fi
+echo "2. Caddy 反代服务  : `$CADDY_STATUS"
+echo "   └─ Cloudflare DNS 插件: `$CF_PLUGIN"
+
+# 3. 检测 BBR v1 状态
+BBR_CONFIG="❌ 未开启 (ENABLE_BBRV1=false)"
+BBR_ACTIVE="❌ 未生效"
+if [ "`$ENABLE_BBR" = "true" ]; then
+  BBR_CONFIG="🟢 已在 .env 中开启"
+  CURRENT_CONG=`$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "未知")
+  if [ "`$CURRENT_CONG" = "bbr" ]; then
+    BBR_ACTIVE="🟢 已成功激活并生效"
+  else
+    BBR_ACTIVE="❌ 配置未生效 (当前算法: `$CURRENT_CONG)"
+  fi
+fi
+echo "3. BBR v1 网络加速 :"
+echo "   ├─ 配置文件配置: `$BBR_CONFIG"
+echo "   └─ 运行状态    : `$BBR_ACTIVE"
+
+# 4. 检测防火墙 (UFW) 状态
+UFW_STATUS="❌ 未启用"
+if command -v ufw >/dev/null 2>&1 && ufw status | grep -q "Status: active"; then
+  UFW_STATUS="🟢 已启用并处于活动状态"
+fi
+echo "4. 防火墙保护 (UFW) : `$UFW_STATUS"
+echo "=================================================="
+echo "提示：基础组件部署成功！"
+echo "下一步：请在本地运行 .\update_server_configs.ps1 上传配置文件并正式启动服务。"
+echo "=================================================="
+echo ""
 "@
 
 $tmpScript = Join-Path $env:TEMP "deploy_frps_caddy_remote.sh"
@@ -256,4 +323,7 @@ Ensure-SshKeyAuth
 
 Write-Host "开始基础部署到 $ServerHost ..." -ForegroundColor Cyan
 (Get-Content $tmpScript -Raw) -replace [char]0xFEFF, "" -replace "`r`n", "`n" | & $ssh @sshOptions -p $SshPort -i $SshPrivateKeyPath -o BatchMode=yes "$SshUser@$ServerHost" "bash -s"
-Write-Host "基础部署完成。" -ForegroundColor Green
+if ($LASTEXITCODE -ne 0) {
+    throw "部署脚本执行失败，请检查上方服务器报错输出。"
+}
+Write-Host "基础部署执行完毕。" -ForegroundColor Green
